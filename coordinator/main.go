@@ -1,3 +1,4 @@
+// coordinator main
 package main
 
 import (
@@ -13,15 +14,20 @@ import (
 	"github.com/LPD-6/resource_donaton_protocol/m/utils"
 )
 
+type Node struct {
+	Conn net.Conn
+	Busy bool
+}
+
 const (
 	port          = ":5000"
 	taskChunkSize = 10 // Number of elements per task
 )
 
 var (
-	nodes        = make(map[string]net.Conn) // Active nodes
-	tasks        = make([]utils.Task, 0)     // Pending tasks
-	results      = make([][]int, 0)          // Results from nodes
+	nodes        = make(map[string]Node) // Active nodes
+	tasks        = make([]utils.Task, 0) // Pending tasks
+	results      = make([][]int, 0)      // Results from nodes
 	taskLock     sync.Mutex
 	nodeLock     sync.Mutex
 	shutdown     = make(chan struct{})
@@ -38,7 +44,7 @@ func main() {
 	log.Printf("Coordinator listening on %s", port)
 
 	// Create tasks
-	createExampleTasks(50)
+	createExampleTasks(500)
 
 	// Accept connections
 	go acceptConnections(listener)
@@ -64,13 +70,17 @@ func main() {
 }
 
 func handleShutdown(listener net.Listener, tasksComplete bool) {
-	// Cleanup listener and node connections
+	// Close the listener to prevent new connections
 	listener.Close()
-	taskLock.Lock()
-	defer taskLock.Unlock()
-	for _, conn := range nodes {
-		conn.Close()
+
+	// Close all node connections
+	nodeLock.Lock()
+	for nodeID, node := range nodes {
+		log.Printf("Closing connection for node %s", nodeID)
+		node.Conn.Close()
+		delete(nodes, nodeID)
 	}
+	nodeLock.Unlock()
 
 	if !tasksComplete {
 		log.Println("Attempting to aggregate partial results during shutdown.")
@@ -141,7 +151,7 @@ func handleNode(conn net.Conn) {
 	}
 
 	nodeLock.Lock()
-	nodes[nodeID] = conn
+	nodes[nodeID] = Node{Conn: conn, Busy: false}
 	nodeLock.Unlock()
 
 	log.Printf("Node %s registered", nodeID)
@@ -160,23 +170,30 @@ func handleNode(conn net.Conn) {
 		taskLock.Lock()
 		for i := range tasks {
 			if tasks[i].ID == result.TaskID {
-				tasks[i].Completed = true // Mark task as completed
+				tasks[i].Completed = true
 				break
 			}
 		}
 		results = append(results, result.SortedChunk)
 		taskLock.Unlock()
 
+		nodeLock.Lock()
+		node := nodes[nodeID]
+		node.Busy = false
+		nodeLock.Unlock()
+
 		log.Printf("Received result for task %s from node %s", result.TaskID, nodeID)
 
 		// Check if all tasks are completed
 		allCompleted := true
+		taskLock.Lock()
 		for _, task := range tasks {
 			if !task.Completed {
 				allCompleted = false
 				break
 			}
 		}
+		taskLock.Unlock()
 		if allCompleted {
 			allTasksDone <- struct{}{}
 		}
@@ -192,39 +209,29 @@ func assignTasks() {
 			time.Sleep(2 * time.Second)
 
 			taskLock.Lock()
-			if len(tasks) == 0 {
-				taskLock.Unlock()
-				continue
-			}
-
 			nodeLock.Lock()
-			for nodeID, conn := range nodes {
-				if len(tasks) == 0 {
-					break
-				}
 
-				// Find the first uncompleted task
-				var taskToSend *utils.Task
-				for i := range tasks {
-					if !tasks[i].Completed {
-						taskToSend = &tasks[i]
-						break
+			// Find an available node and an uncompleted, unassigned task
+			for nodeID, node := range nodes {
+				if !node.Busy {
+					for i := range tasks {
+						if !tasks[i].Completed && !tasks[i].Assigned {
+							tasks[i].Assigned = true
+							node := nodes[nodeID]
+							node.Busy = true
+							encoder := json.NewEncoder(node.Conn)
+							if err := encoder.Encode(tasks[i]); err != nil {
+								log.Printf("Error assigning task to node %s: %v", nodeID, utils.ErrTaskAssignment)
+							} else {
+								log.Printf("Assigned task %s to node %s", tasks[i].ID, nodeID)
+							}
+							goto NextIteration
+						}
 					}
 				}
-
-				// If no uncompleted task is found, skip assignment
-				if taskToSend == nil {
-					break
-				}
-
-				// Assign task
-				encoder := json.NewEncoder(conn)
-				if err := encoder.Encode(*taskToSend); err != nil {
-					log.Printf("Error assigning task to node %s: %v", nodeID, utils.ErrTaskAssignment)
-				} else {
-					log.Printf("Assigned task %s to node %s", taskToSend.ID, nodeID)
-				}
+			NextIteration:
 			}
+
 			nodeLock.Unlock()
 			taskLock.Unlock()
 		}

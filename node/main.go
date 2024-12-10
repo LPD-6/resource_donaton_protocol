@@ -1,3 +1,4 @@
+// node main
 package main
 
 import (
