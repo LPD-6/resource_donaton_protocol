@@ -18,7 +18,6 @@ import (
 
 const (
 	coordinatorAddress = "localhost:5000"
-	maxConcurrentTasks = 3
 )
 
 func generateNodeID() string {
@@ -31,22 +30,21 @@ var (
 )
 
 func main() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-
 	nodeID := generateNodeID()
 	conn, err := net.Dial("tcp", coordinatorAddress)
 	if err != nil {
-		log.Printf("ERROR: failed to connect to coordinator: %v", err)
-		return
+		log.Fatalf("Failed to connect to coordinator: %v", err)
 	}
 	defer conn.Close()
 
-	log.Printf("INFO: node %s connected to coordinator", nodeID)
+	log.Printf("Node %s connected to coordinator", nodeID)
 
 	encoder := json.NewEncoder(conn)
+	decoder := json.NewDecoder(conn)
+
+	// Send node ID to coordinator
 	if err := encoder.Encode(nodeID); err != nil {
-		log.Printf("ERROR: failed to register node: %v", err)
-		return
+		log.Fatalf("Failed to register node: %v", err)
 	}
 
 	var wg sync.WaitGroup
@@ -59,9 +57,10 @@ func main() {
 		<-sig
 		close(shutdown)
 		conn.Close()
-		log.Printf("INFO: node %s shutting down gracefully", nodeID)
+		log.Printf("Node %s shutting down gracefully", nodeID)
 		wg.Done()
 	}()
+
 	// Continuously listen for tasks
 	go func() {
 		defer wg.Done()
@@ -93,21 +92,5 @@ func main() {
 		}
 	}()
 
-	// Receive tasks
-	decoder := json.NewDecoder(conn)
-	for {
-		var task utils.Task
-		if err := decoder.Decode(&task); err != nil {
-			log.Printf("ERROR: error receiving task: %v", err)
-			continue
-		}
-
-		// Assign task to processing channel
-		select {
-		case taskChan <- task:
-			log.Printf("INFO: received task %s", task.ID)
-		default:
-			log.Printf("WARN: task %s dropped due to full task queue", task.ID)
-		}
-	}
+	wg.Wait()
 }

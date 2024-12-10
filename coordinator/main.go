@@ -35,11 +35,9 @@ var (
 )
 
 func main() {
-	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
-
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
-		log.Fatalf("ERROR: failed to start coordinator: %v", err)
+		log.Fatalf("Failed to start coordinator: %v", err)
 	}
 	defer listener.Close()
 
@@ -54,32 +52,18 @@ func main() {
 	// Start task assignment loop
 	go assignTasks()
 
-	// Heartbeat checker
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				checkNodeHeartbeats()
-			case <-shutdown:
-				return
-			}
-		}
-	}()
-
 	// Wait for shutdown or all tasks to complete
 	select {
 	case <-shutdown:
-		log.Println("INFO: coordinator shutting down gracefully")
-		handleShutdown(listener, false)
+		log.Println("Coordinator shutting down gracefully")
+		handleShutdown(listener, false) // Attempt to aggregate partial results
 	case <-allTasksDone:
-		log.Println("INFO: all tasks completed. aggregating results.")
+		log.Println("All tasks completed. Aggregating results.")
 		finalArray, err := aggregateResults()
 		if err != nil {
-			log.Printf("ERROR: error during result aggregation: %v", err)
+			log.Printf("Error during result aggregation: %v", err)
 		} else {
-			log.Printf("INFO: final sorted array: %v", finalArray)
+			log.Printf("Final Sorted Array: %v", finalArray)
 		}
 		handleShutdown(listener, true)
 	}
@@ -99,12 +83,12 @@ func handleShutdown(listener net.Listener, tasksComplete bool) {
 	nodeLock.Unlock()
 
 	if !tasksComplete {
-		log.Println("INFO: attempting to aggregate partial results during shutdown.")
+		log.Println("Attempting to aggregate partial results during shutdown.")
 		finalArray, err := aggregateResults()
 		if err != nil {
-			log.Printf("ERROR: error aggregating partial results: %v", err)
+			log.Printf("Error aggregating partial results: %v", err)
 		} else {
-			log.Printf("INFO: partially sorted array: %v", finalArray)
+			log.Printf("Partially Sorted Array: %v", finalArray)
 		}
 	}
 }
@@ -125,7 +109,7 @@ func createExampleTasks(size int) {
 		tasks = append(tasks, task)
 	}
 
-	log.Printf("INFO: created %d tasks", len(tasks))
+	log.Printf("Created %d tasks", len(tasks))
 }
 
 func generateRandomArray(size int) []int {
@@ -142,10 +126,10 @@ func acceptConnections(listener net.Listener) {
 		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				log.Println("INFO: listener closed")
+				log.Println("Listener closed")
 				return
 			}
-			log.Printf("ERROR: error accepting connection: %v", err)
+			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
 
@@ -162,7 +146,7 @@ func handleNode(conn net.Conn) {
 
 	// Receive node ID
 	if err := decoder.Decode(&nodeID); err != nil {
-		log.Printf("ERROR: error registering node: %v", utils.ErrNodeRegistration)
+		log.Printf("Error registering node: %v", utils.ErrNodeRegistration)
 		return
 	}
 
@@ -170,31 +154,29 @@ func handleNode(conn net.Conn) {
 	nodes[nodeID] = Node{Conn: conn, Busy: false}
 	nodeLock.Unlock()
 
-	log.Printf("INFO: node %s registered", nodeID)
+	log.Printf("Node %s registered", nodeID)
 
-	// Continuously listen for results and heartbeats
+	// Continuously listen for results
 	for {
-		var msg struct {
-			Type string
-			Data interface{}
-		}
-		if err := decoder.Decode(&msg); err != nil {
-			log.Printf("ERROR: node %s disconnected: %v", nodeID, utils.ErrNodeDisconnected)
+		var result utils.Result
+		if err := decoder.Decode(&result); err != nil {
+			log.Printf("Node %s disconnected: %v", nodeID, utils.ErrNodeDisconnected)
 			nodeLock.Lock()
 			delete(nodes, nodeID)
-			delete(nodeHeartbeats, nodeID)
 			nodeLock.Unlock()
 			break
 		}
+
 		taskLock.Lock()
 		for i := range tasks {
 			if tasks[i].ID == result.TaskID {
 				tasks[i].Completed = true
 				break
 			}
-			results = append(results, result.SortedChunk)
-			taskLock.Unlock()
-      
+		}
+		results = append(results, result.SortedChunk)
+		taskLock.Unlock()
+
 		nodeLock.Lock()
 		node := nodes[nodeID]
 		node.Busy = false
@@ -256,23 +238,11 @@ func assignTasks() {
 				}
 			NextIteration:
 			}
+
 			nodeLock.Unlock()
 			taskLock.Unlock()
 		}
 	}
-}
-
-func checkNodeHeartbeats() {
-    nodeLock.Lock()
-    currentTime := time.Now()
-    for nodeID, lastHeartbeat := range nodeHeartbeats {
-        if currentTime.Sub(lastHeartbeat) > 30*time.Second {
-            log.Printf("WARN: node %s missed heartbeat, removing...", nodeID)
-            delete(nodes, nodeID)
-            delete(nodeHeartbeats, nodeID)
-        }
-    }
-    nodeLock.Unlock()
 }
 
 func aggregateResults() ([]int, error) {
