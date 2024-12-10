@@ -134,37 +134,50 @@ func handleNode(conn net.Conn) {
 	var nodeID string
 	decoder := json.NewDecoder(conn)
 
-	// Initial handshake: Receive node ID
+	// Receive node ID
 	if err := decoder.Decode(&nodeID); err != nil {
-		log.Printf("Error: %v", utils.ErrNodeRegistration)
+		log.Printf("Error registering node: %v", utils.ErrNodeRegistration)
 		return
 	}
 
-	taskLock.Lock()
+	nodeLock.Lock()
 	nodes[nodeID] = conn
-	taskLock.Unlock()
+	nodeLock.Unlock()
 
 	log.Printf("Node %s registered", nodeID)
 
-	// Continuously receive results from the node
+	// Continuously listen for results
 	for {
 		var result utils.Result
 		if err := decoder.Decode(&result); err != nil {
-			log.Printf("Error: %v for node %s: %v", utils.ErrNodeDisconnected, nodeID, err)
-			taskLock.Lock()
+			log.Printf("Node %s disconnected: %v", nodeID, utils.ErrNodeDisconnected)
+			nodeLock.Lock()
 			delete(nodes, nodeID)
-			taskLock.Unlock()
+			nodeLock.Unlock()
 			break
 		}
 
-		// Save result and log
 		taskLock.Lock()
+		for i := range tasks {
+			if tasks[i].ID == result.TaskID {
+				tasks[i].Completed = true // Mark task as completed
+				break
+			}
+		}
 		results = append(results, result.SortedChunk)
 		taskLock.Unlock()
+
 		log.Printf("Received result for task %s from node %s", result.TaskID, nodeID)
 
-		// Check if all tasks are done
-		if len(results) == len(tasks) {
+		// Check if all tasks are completed
+		allCompleted := true
+		for _, task := range tasks {
+			if !task.Completed {
+				allCompleted = false
+				break
+			}
+		}
+		if allCompleted {
 			allTasksDone <- struct{}{}
 		}
 	}
@@ -190,15 +203,26 @@ func assignTasks() {
 					break
 				}
 
-				// Assign task to node
-				task := tasks[0]
-				tasks = tasks[1:]
+				// Find the first uncompleted task
+				var taskToSend *utils.Task
+				for i := range tasks {
+					if !tasks[i].Completed {
+						taskToSend = &tasks[i]
+						break
+					}
+				}
+
+				// If no uncompleted task is found, skip assignment
+				if taskToSend == nil {
+					break
+				}
+
+				// Assign task
 				encoder := json.NewEncoder(conn)
-				if err := encoder.Encode(task); err != nil {
-					log.Printf("Error: %v for node %s: %v", utils.ErrTaskAssignment, nodeID, err)
-					tasks = append(tasks, task) // Re-add task if sending fails
+				if err := encoder.Encode(*taskToSend); err != nil {
+					log.Printf("Error assigning task to node %s: %v", nodeID, utils.ErrTaskAssignment)
 				} else {
-					log.Printf("Assigned task %s to node %s", task.ID, nodeID)
+					log.Printf("Assigned task %s to node %s", taskToSend.ID, nodeID)
 				}
 			}
 			nodeLock.Unlock()
