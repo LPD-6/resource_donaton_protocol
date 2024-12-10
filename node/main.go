@@ -62,42 +62,34 @@ func main() {
 		log.Printf("INFO: node %s shutting down gracefully", nodeID)
 		wg.Done()
 	}()
-
-	// Continuously send heartbeats
+	// Continuously listen for tasks
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
+		defer wg.Done()
 		for {
-			select {
-			case <-ticker.C:
-				encoder := json.NewEncoder(conn)
-				if err := encoder.Encode(struct {
-					Type string
-				}{
-					Type: "heartbeat",
-				}); err != nil {
-					log.Printf("ERROR: error sending heartbeat: %v", err)
+			var task utils.Task
+			if err := decoder.Decode(&task); err != nil {
+				if err.Error() == "EOF" {
+					log.Printf("Node %s received termination message. Shutting down.", nodeID)
+					return
+				} else if task.ID == utils.TerminationMessage {
+					log.Printf("Node %s received termination message. Shutting down.", nodeID)
+					return
 				}
-			case <-shutdown:
+				log.Printf("Error receiving task: %v", err)
 				return
 			}
-		}
-	}()
 
-	// Process tasks concurrently
-	taskChan := make(chan utils.Task, maxConcurrentTasks)
-	go func() {
-		for task := range taskChan {
-			// Process task
+			log.Printf("Processing task %s", task.ID)
 			sorted := utils.MergeSort(task.Array)
 
 			// Send result back to coordinator
 			result := utils.Result{TaskID: task.ID, SortedChunk: sorted}
-			encoder := json.NewEncoder(conn)
 			if err := encoder.Encode(result); err != nil {
-				log.Printf("ERROR: error sending result: %v", err)
+				log.Printf("Failed to send result: %v", err)
+				return
 			}
-			log.Printf("INFO: completed task %s", task.ID)
+
+			log.Printf("Completed task %s", task.ID)
 		}
 	}()
 
