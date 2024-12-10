@@ -1,3 +1,4 @@
+// coordinator main
 package main
 
 import (
@@ -19,19 +20,22 @@ const (
 )
 
 var (
-	nodes        = make(map[string]net.Conn) // Active nodes
-	tasks        = make([]utils.Task, 0)     // Pending tasks
-	results      = make([][]int, 0)          // Results from nodes
-	taskLock     sync.Mutex
-	nodeLock     sync.Mutex
-	shutdown     = make(chan struct{})
-	allTasksDone = make(chan struct{}, 1) // Notify when all tasks are completed
+	nodes          = make(map[string]net.Conn) // Active nodes
+	tasks          = make([]utils.Task, 0)     // Pending tasks
+	results        = make([][]int, 0)          // Results from nodes
+	taskLock       sync.Mutex
+	nodeLock       sync.Mutex
+	shutdown       = make(chan struct{})
+	allTasksDone   = make(chan struct{}, 1) // Notify when all tasks are completed
+	nodeHeartbeats = make(map[string]time.Time)
 )
 
 func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
 	listener, err := net.Listen("tcp", port)
 	if err != nil {
-		log.Fatalf("Failed to start coordinator: %v", err)
+		log.Fatalf("ERROR: failed to start coordinator: %v", err)
 	}
 	defer listener.Close()
 
@@ -46,18 +50,32 @@ func main() {
 	// Start task assignment loop
 	go assignTasks()
 
+	// Heartbeat checker
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				checkNodeHeartbeats()
+			case <-shutdown:
+				return
+			}
+		}
+	}()
+
 	// Wait for shutdown or all tasks to complete
 	select {
 	case <-shutdown:
-		log.Println("Coordinator shutting down gracefully")
-		handleShutdown(listener, false) // Attempt to aggregate partial results
+		log.Println("INFO: coordinator shutting down gracefully")
+		handleShutdown(listener, false)
 	case <-allTasksDone:
-		log.Println("All tasks completed. Aggregating results.")
+		log.Println("INFO: all tasks completed. aggregating results.")
 		finalArray, err := aggregateResults()
 		if err != nil {
-			log.Printf("Error during result aggregation: %v", err)
+			log.Printf("ERROR: error during result aggregation: %v", err)
 		} else {
-			log.Printf("Final Sorted Array: %v", finalArray)
+			log.Printf("INFO: final sorted array: %v", finalArray)
 		}
 		handleShutdown(listener, true)
 	}
@@ -73,12 +91,12 @@ func handleShutdown(listener net.Listener, tasksComplete bool) {
 	}
 
 	if !tasksComplete {
-		log.Println("Attempting to aggregate partial results during shutdown.")
+		log.Println("INFO: attempting to aggregate partial results during shutdown.")
 		finalArray, err := aggregateResults()
 		if err != nil {
-			log.Printf("Error aggregating partial results: %v", err)
+			log.Printf("ERROR: error aggregating partial results: %v", err)
 		} else {
-			log.Printf("Partially Sorted Array: %v", finalArray)
+			log.Printf("INFO: partially sorted array: %v", finalArray)
 		}
 	}
 }
@@ -99,7 +117,7 @@ func createExampleTasks(size int) {
 		tasks = append(tasks, task)
 	}
 
-	log.Printf("Created %d tasks", len(tasks))
+	log.Printf("INFO: created %d tasks", len(tasks))
 }
 
 func generateRandomArray(size int) []int {
@@ -116,10 +134,10 @@ func acceptConnections(listener net.Listener) {
 		conn, err := listener.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				log.Println("Listener closed")
+				log.Println("INFO: listener closed")
 				return
 			}
-			log.Printf("Error accepting connection: %v", err)
+			log.Printf("ERROR: error accepting connection: %v", err)
 			continue
 		}
 
@@ -136,49 +154,70 @@ func handleNode(conn net.Conn) {
 
 	// Receive node ID
 	if err := decoder.Decode(&nodeID); err != nil {
-		log.Printf("Error registering node: %v", utils.ErrNodeRegistration)
+		log.Printf("ERROR: error registering node: %v", utils.ErrNodeRegistration)
 		return
 	}
 
 	nodeLock.Lock()
 	nodes[nodeID] = conn
+	nodeHeartbeats[nodeID] = time.Now()
 	nodeLock.Unlock()
 
-	log.Printf("Node %s registered", nodeID)
+	log.Printf("INFO: node %s registered", nodeID)
 
-	// Continuously listen for results
+	// Continuously listen for results and heartbeats
 	for {
-		var result utils.Result
-		if err := decoder.Decode(&result); err != nil {
-			log.Printf("Node %s disconnected: %v", nodeID, utils.ErrNodeDisconnected)
+		var msg struct {
+			Type string
+			Data interface{}
+		}
+		if err := decoder.Decode(&msg); err != nil {
+			log.Printf("ERROR: node %s disconnected: %v", nodeID, utils.ErrNodeDisconnected)
 			nodeLock.Lock()
 			delete(nodes, nodeID)
+			delete(nodeHeartbeats, nodeID)
 			nodeLock.Unlock()
 			break
 		}
 
-		taskLock.Lock()
-		for i := range tasks {
-			if tasks[i].ID == result.TaskID {
-				tasks[i].Completed = true // Mark task as completed
-				break
+		switch msg.Type {
+		case "result":
+			var result utils.Result
+			if err := json.Unmarshal(msg.Data.([]byte), &result); err != nil {
+				log.Printf("ERROR: error unmarshaling result from node %s: %v", nodeID, err)
+				continue
 			}
-		}
-		results = append(results, result.SortedChunk)
-		taskLock.Unlock()
 
-		log.Printf("Received result for task %s from node %s", result.TaskID, nodeID)
-
-		// Check if all tasks are completed
-		allCompleted := true
-		for _, task := range tasks {
-			if !task.Completed {
-				allCompleted = false
-				break
+			taskLock.Lock()
+			for i := range tasks {
+				if tasks[i].ID == result.TaskID {
+					tasks[i].Completed = true
+					break
+				}
 			}
-		}
-		if allCompleted {
-			allTasksDone <- struct{}{}
+			results = append(results, result.SortedChunk)
+			taskLock.Unlock()
+
+			log.Printf("INFO: received result for task %s from node %s", result.TaskID, nodeID)
+
+			// Check if all tasks are completed
+			allCompleted := true
+			taskLock.Lock()
+			for _, task := range tasks {
+				if !task.Completed {
+					allCompleted = false
+					break
+				}
+			}
+			taskLock.Unlock()
+			if allCompleted {
+				allTasksDone <- struct{}{}
+			}
+		case "heartbeat":
+			nodeLock.Lock()
+			nodeHeartbeats[nodeID] = time.Now()
+			nodeLock.Unlock()
+			log.Printf("INFO: received heartbeat from node %s", nodeID)
 		}
 	}
 }
@@ -218,17 +257,31 @@ func assignTasks() {
 				}
 
 				// Assign task
-				encoder := json.NewEncoder(conn)
-				if err := encoder.Encode(*taskToSend); err != nil {
-					log.Printf("Error assigning task to node %s: %v", nodeID, utils.ErrTaskAssignment)
-				} else {
-					log.Printf("Assigned task %s to node %s", taskToSend.ID, nodeID)
-				}
-			}
-			nodeLock.Unlock()
-			taskLock.Unlock()
+                encoder := json.NewEncoder(conn)
+                if err := encoder.Encode(*taskToSend); err!= nil {
+                    log.Printf("ERROR: error assigning task to node %s: %v", nodeID, utils.ErrTaskAssignment)
+                } else {
+                    log.Printf("INFO: assigned task %s to node %s", taskToSend.ID, nodeID)
+                }
+                tasks = tasks[1:]
+            }
+            nodeLock.Unlock()
+            taskLock.Unlock()
 		}
 	}
+}
+
+func checkNodeHeartbeats() {
+    nodeLock.Lock()
+    currentTime := time.Now()
+    for nodeID, lastHeartbeat := range nodeHeartbeats {
+        if currentTime.Sub(lastHeartbeat) > 30*time.Second {
+            log.Printf("WARN: node %s missed heartbeat, removing...", nodeID)
+            delete(nodes, nodeID)
+            delete(nodeHeartbeats, nodeID)
+        }
+    }
+    nodeLock.Unlock()
 }
 
 func aggregateResults() ([]int, error) {

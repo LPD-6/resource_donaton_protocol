@@ -1,3 +1,4 @@
+// node main
 package main
 
 import (
@@ -17,6 +18,7 @@ import (
 
 const (
 	coordinatorAddress = "localhost:5000"
+	maxConcurrentTasks = 3
 )
 
 func generateNodeID() string {
@@ -29,21 +31,22 @@ var (
 )
 
 func main() {
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+
 	nodeID := generateNodeID()
 	conn, err := net.Dial("tcp", coordinatorAddress)
 	if err != nil {
-		log.Fatalf("Failed to connect to coordinator: %v", err)
+		log.Printf("ERROR: failed to connect to coordinator: %v", err)
+		return
 	}
 	defer conn.Close()
 
-	log.Printf("Node %s connected to coordinator", nodeID)
+	log.Printf("INFO: node %s connected to coordinator", nodeID)
 
 	encoder := json.NewEncoder(conn)
-	decoder := json.NewDecoder(conn)
-
-	// Send node ID to coordinator
 	if err := encoder.Encode(nodeID); err != nil {
-		log.Fatalf("Failed to register node: %v", err)
+		log.Printf("ERROR: failed to register node: %v", err)
+		return
 	}
 
 	var wg sync.WaitGroup
@@ -56,37 +59,63 @@ func main() {
 		<-sig
 		close(shutdown)
 		conn.Close()
-		log.Printf("Node %s shutting down gracefully", nodeID)
+		log.Printf("INFO: node %s shutting down gracefully", nodeID)
 		wg.Done()
 	}()
 
-	// Continuously receive tasks and process them
+	// Continuously send heartbeats
 	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
 		for {
 			select {
+			case <-ticker.C:
+				encoder := json.NewEncoder(conn)
+				if err := encoder.Encode(struct {
+					Type string
+				}{
+					Type: "heartbeat",
+				}); err != nil {
+					log.Printf("ERROR: error sending heartbeat: %v", err)
+				}
 			case <-shutdown:
 				return
-			default:
-				var task utils.Task
-				if err := decoder.Decode(&task); err != nil {
-					log.Printf("Failed to receive task: %v", err)
-					return
-				}
-
-				log.Printf("Processing task %s", task.ID)
-				sorted := utils.MergeSort(task.Array)
-
-				// Send result back to coordinator
-				result := utils.Result{TaskID: task.ID, SortedChunk: sorted}
-				if err := encoder.Encode(result); err != nil {
-					log.Printf("Failed to send result: %v", err)
-					return
-				}
-
-				log.Printf("Completed task %s", task.ID)
 			}
 		}
 	}()
 
-	wg.Wait()
+	// Process tasks concurrently
+	taskChan := make(chan utils.Task, maxConcurrentTasks)
+	go func() {
+		for task := range taskChan {
+			// Process task
+			sorted := utils.MergeSort(task.Array)
+
+			// Send result back to coordinator
+			result := utils.Result{TaskID: task.ID, SortedChunk: sorted}
+			encoder := json.NewEncoder(conn)
+			if err := encoder.Encode(result); err != nil {
+				log.Printf("ERROR: error sending result: %v", err)
+			}
+			log.Printf("INFO: completed task %s", task.ID)
+		}
+	}()
+
+	// Receive tasks
+	decoder := json.NewDecoder(conn)
+	for {
+		var task utils.Task
+		if err := decoder.Decode(&task); err != nil {
+			log.Printf("ERROR: error receiving task: %v", err)
+			continue
+		}
+
+		// Assign task to processing channel
+		select {
+		case taskChan <- task:
+			log.Printf("INFO: received task %s", task.ID)
+		default:
+			log.Printf("WARN: task %s dropped due to full task queue", task.ID)
+		}
+	}
 }
