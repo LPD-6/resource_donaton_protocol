@@ -196,6 +196,13 @@ func handleNode(conn net.Conn) {
 		taskLock.Unlock()
 		if allCompleted {
 			allTasksDone <- struct{}{}
+
+			// Send termination message to the node
+			encoder := json.NewEncoder(conn)
+			if err := encoder.Encode(utils.TerminationMessage); err != nil {
+				log.Printf("Error sending termination message to node %s: %v", nodeID, err)
+			}
+			break
 		}
 	}
 }

@@ -61,31 +61,34 @@ func main() {
 		wg.Done()
 	}()
 
-	// Continuously receive tasks and process them
+	// Continuously listen for tasks
 	go func() {
+		defer wg.Done()
 		for {
-			select {
-			case <-shutdown:
+			var task utils.Task
+			if err := decoder.Decode(&task); err != nil {
+				if err.Error() == "EOF" {
+					log.Printf("Node %s received termination message. Shutting down.", nodeID)
+					return
+				} else if task.ID == utils.TerminationMessage {
+					log.Printf("Node %s received termination message. Shutting down.", nodeID)
+					return
+				}
+				log.Printf("Error receiving task: %v", err)
 				return
-			default:
-				var task utils.Task
-				if err := decoder.Decode(&task); err != nil {
-					log.Printf("Failed to receive task: %v", err)
-					return
-				}
-
-				log.Printf("Processing task %s", task.ID)
-				sorted := utils.MergeSort(task.Array)
-
-				// Send result back to coordinator
-				result := utils.Result{TaskID: task.ID, SortedChunk: sorted}
-				if err := encoder.Encode(result); err != nil {
-					log.Printf("Failed to send result: %v", err)
-					return
-				}
-
-				log.Printf("Completed task %s", task.ID)
 			}
+
+			log.Printf("Processing task %s", task.ID)
+			sorted := utils.MergeSort(task.Array)
+
+			// Send result back to coordinator
+			result := utils.Result{TaskID: task.ID, SortedChunk: sorted}
+			if err := encoder.Encode(result); err != nil {
+				log.Printf("Failed to send result: %v", err)
+				return
+			}
+
+			log.Printf("Completed task %s", task.ID)
 		}
 	}()
 

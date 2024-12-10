@@ -7,4 +7,5 @@ var (
     ErrResultAggregation = errors.New("failed to aggregate results")
     ErrNodeRegistration  = errors.New("failed to register node")
     ErrNodeDisconnected = errors.New("node disconnected")
+    TerminationMessage = "TERMINATE"
 )
